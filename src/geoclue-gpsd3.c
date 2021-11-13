@@ -78,6 +78,89 @@ typedef struct {
 	GcProviderClass parent_class;
 } GeoclueGpsdClass;
 
+#define INT_ADD_RANGE_OVERFLOW(a, b, min, max)          \
+  ((b) < 0                                              \
+   ? (a) < (min) - (b)                                  \
+   : (max) - (b) < (a))
+
+# define _GL_ADD_OVERFLOW(a, b, min, max)                                \
+   ((min) < 0 ? INT_ADD_RANGE_OVERFLOW (a, b, min, max)                  \
+    : (a) < 0 ? (b) <= (a) + (b)                                         \
+    : (b) < 0 ? (a) <= (a) + (b)                                         \
+    : (a) + (b) < (b))
+
+#define _GL_INT_CONVERT(e, v) ((1 ? 0 : (e)) + (v))
+#define _GL_INT_NEGATE_CONVERT(e, v) ((1 ? 0 : (e)) - (v))
+#define EXPR_SIGNED(e) (_GL_INT_NEGATE_CONVERT (e, 1) < 0)
+#define TYPE_WIDTH(t) (sizeof (t) * CHAR_BIT)
+
+/* The maximum and minimum values for the type of the expression E,
+   after integer promotion.  E is not evaluated.  */
+#define _GL_INT_MINIMUM(e)                                              \
+  (EXPR_SIGNED (e)                                                      \
+   ? ~ _GL_SIGNED_INT_MAXIMUM (e)                                       \
+   : _GL_INT_CONVERT (e, 0))
+#define _GL_INT_MAXIMUM(e)                                              \
+  (EXPR_SIGNED (e)                                                      \
+   ? _GL_SIGNED_INT_MAXIMUM (e)                                         \
+   : _GL_INT_NEGATE_CONVERT (e, 1))
+#define _GL_SIGNED_INT_MAXIMUM(e)                                       \
+  (((_GL_INT_CONVERT (e, 1) << (TYPE_WIDTH (+ (e)) - 2)) - 1) * 2 + 1)
+
+
+#define _GL_BINARY_OP_OVERFLOW(a, b, op_result_overflow)        \
+  op_result_overflow (a, b,                                     \
+                      _GL_INT_MINIMUM (_GL_INT_CONVERT (a, b)), \
+                      _GL_INT_MAXIMUM (_GL_INT_CONVERT (a, b)))
+
+#define INT_ADD_OVERFLOW(a, b) \
+  _GL_BINARY_OP_OVERFLOW (a, b, _GL_ADD_OVERFLOW)
+
+struct timespec
+timespec_add (struct timespec a, struct timespec b)
+{
+  struct timespec r;
+  time_t rs = a.tv_sec;
+  time_t bs = b.tv_sec;
+  int ns = a.tv_nsec + b.tv_nsec;
+  int nsd = ns - 1000000000;
+  int rns = ns;
+
+  if (0 <= nsd)
+    {
+      rns = nsd;
+      if (rs == INT_MAX)
+        {
+          if (0 <= bs)
+            goto high_overflow;
+          bs++;
+        }
+      else
+        rs++;
+    }
+
+  if (INT_ADD_OVERFLOW (rs, bs))
+    {
+      if (rs < 0)
+        {
+          rs = INT_MIN;
+          rns = 0;
+        }
+      else
+        {
+        high_overflow:
+          rs = INT_MAX;
+          rns = 999999999;
+        }
+    }
+  else
+    rs += bs;
+
+  r.tv_sec = rs;
+  r.tv_nsec = rns;
+  return r;
+}
+
 static void geoclue_gpsd_position_init (GcIfacePositionClass *iface);
 static void geoclue_gpsd_velocity_init (GcIfaceVelocityClass *iface);
 static void geoclue_gpsd_satellite_init (GcIfaceSatelliteClass *iface);
@@ -281,9 +364,10 @@ geoclue_gpsd_update_position (GeoclueGpsd *gpsd)
 	gpsd->last_pos_fields |= (isnan (gps_raw_data.fix.altitude)) ? 
 	                         0 : GEOCLUE_POSITION_FIELDS_ALTITUDE;
 	
+    struct timespec half = {0,500000000};
 	gc_iface_position_emit_position_changed 
 		(GC_IFACE_POSITION (gpsd), gpsd->last_pos_fields,
-		 (int)(last_fix->time+0.5), 
+		 (int)(timespec_add(last_fix->time, half).tv_sec),
 		 last_fix->latitude, last_fix->longitude, last_fix->altitude, 
 		 gpsd->last_accuracy);
 	
@@ -340,9 +424,10 @@ geoclue_gpsd_update_velocity (GeoclueGpsd *gpsd)
 		gpsd->last_velo_fields |= (isnan (last_fix->climb)) ?
 			0 : GEOCLUE_VELOCITY_FIELDS_CLIMB;
 		
+        struct timespec half = {0,500000000};
 		gc_iface_velocity_emit_velocity_changed 
 			(GC_IFACE_VELOCITY (gpsd), gpsd->last_velo_fields,
-			 (int)(last_fix->time+0.5),
+		    (int)(timespec_add(last_fix->time, half).tv_sec),
 			 last_fix->speed, last_fix->track, last_fix->climb);
 	}
 }
@@ -359,7 +444,7 @@ geoclue_gpsd_update_satellite (GeoclueGpsd *gpsd)
 	
 	int satellites_used = gps_raw_data.satellites_used;
 	int satellites_visible = gps_raw_data.satellites_visible;
-	int timestamp = gps_raw_data.skyview_time;
+	int timestamp = gps_raw_data.skyview_time.tv_sec;
 
 	if(satellites_visible > 0) {
 		if(satellites_visible > MAXCHANNELS) {
@@ -409,12 +494,12 @@ geoclue_gpsd_update_status (GeoclueGpsd *gpsd)
 	GeoclueStatus status;
 	
 	/* gpsdata->online is supposedly always up-to-date */
-	if (gps_raw_data.online <= 0) {
+	if (gps_raw_data.online.tv_sec <= 0) {
 		status = GEOCLUE_STATUS_UNAVAILABLE;
 	} else if (gps_raw_data.set & STATUS_SET) {
 		gps_raw_data.set &= ~(STATUS_SET);
 		
-		if (gps_raw_data.status > 0) {
+		if (gps_raw_data.fix.status > 0) {
 			status = GEOCLUE_STATUS_AVAILABLE;
 		} else {
 			status = GEOCLUE_STATUS_ACQUIRING;
@@ -511,8 +596,9 @@ get_position (GcIfacePosition       *gc,
               GError               **error)
 {
 	GeoclueGpsd *gpsd = GEOCLUE_GPSD (gc);
-	
-	*timestamp = (int)(gpsd->last_fix->time+0.5);
+    struct timespec half = {0,500000000};
+
+    *timestamp = (int)(timespec_add(gpsd->last_fix->time, half).tv_sec),
 	*latitude = gpsd->last_fix->latitude;
 	*longitude = gpsd->last_fix->longitude;
 	*altitude = gpsd->last_fix->altitude;
@@ -538,8 +624,9 @@ get_velocity (GcIfaceVelocity       *gc,
               GError               **error)
 {
 	GeoclueGpsd *gpsd = GEOCLUE_GPSD (gc);
-	
-	*timestamp = (int)(gpsd->last_fix->time+0.5);
+    struct timespec half = {0,500000000};
+
+    *timestamp = (int)(timespec_add(gpsd->last_fix->time, half).tv_sec),
 	*speed = gpsd->last_fix->speed;
 	*direction = gpsd->last_fix->track;
 	*climb = gpsd->last_fix->climb;
@@ -558,7 +645,7 @@ get_satellite (GcIfaceSatellite *gc,
 				    GError          **error)
 {
 	GeoclueGpsd *gpsd = GEOCLUE_GPSD (gc);
-	*timestamp = (time_t) gps_raw_data.skyview_time;
+	*timestamp = (time_t) gps_raw_data.skyview_time.tv_sec;
 	*satellite_used = gps_raw_data.satellites_used;
 	*satellite_visible = gps_raw_data.satellites_visible; 
 
